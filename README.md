@@ -6,6 +6,12 @@ State updates live over the Home Assistant WebSocket API, so changes made anywhe
 
 > Not affiliated with or endorsed by the Home Assistant project.
 
+<p align="center">
+  <img src="docs/screenshots/panel.png" alt="Menu bar panel with climate controls, switches and a live power sparkline" width="360">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/settings.png" alt="Settings window showing a live connection status" width="420">
+</p>
+
 ## Features
 
 - **Menu bar panel.** It opens from the menu bar with a single click, and the app has no Dock icon.
