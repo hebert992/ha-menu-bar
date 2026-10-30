@@ -7,31 +7,24 @@ struct ClimateRow: View {
     @Environment(HomeStore.self) private var store
     let entity: Entity
 
+    /// Target chosen with −/+ but not sent yet. Changing it restarts the debounce in `.task(id:)`.
     @State private var pendingTarget: Double?
-    @State private var sendTask: Task<Void, Never>?
 
     private var displayedTarget: Double? { pendingTarget ?? entity.targetTemperature }
 
     var body: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 10) {
-                IconBadge(symbol: entity.symbolName, tint: entity.tint, active: entity.isOn)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(entity.friendlyName)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .lineLimit(1)
-                    HStack(spacing: 4) {
-                        HVACModeMenu(entity: entity) { store.perform(.setHvacMode($0), on: entity) }
-                        if let detail = ClimateRow.detail(for: entity) {
-                            Text("· \(detail)")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
+            EntityRowLabel(entity: entity, active: entity.isOn) {
+                HStack(spacing: 4) {
+                    HVACModeMenu(entity: entity) { store.perform(.setHvacMode($0), on: entity) }
+                    if let detail = ClimateRow.detail(for: entity) {
+                        Text("· \(detail)")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
             }
-            .help(entity.entityId)
             Spacer(minLength: 4)
             TemperatureStepper(
                 value: displayedTarget,
@@ -44,38 +37,31 @@ struct ClimateRow: View {
             }
             .disabled(entity.isUnavailable)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
+        // Debounced: rapid taps are merged and sent once, 600 ms after the last one.
+        .task(id: pendingTarget) {
+            guard let target = pendingTarget else { return }
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            store.perform(.setTemperature(target), on: entity)
+            pendingTarget = nil
+        }
     }
 
-    /// Debounced: rapid taps are merged and sent once, 600 ms after the last one.
     private func adjust(by delta: Double) {
         guard let next = entity.adjustedTargetTemperature(by: delta, from: displayedTarget) else { return }
         pendingTarget = next
-        sendTask?.cancel()
-        sendTask = Task {
-            try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled else { return }
-            store.perform(.setTemperature(next), on: entity)
-            pendingTarget = nil
-        }
     }
 
     /// Text shown after the mode menu, e.g. "Cooling · Now 24°".
     static func detail(for entity: Entity) -> String? {
         var parts: [String] = []
         if entity.isOn, let action = entity.hvacAction, action != "idle", action != "off" {
-            parts.append(action.replacingOccurrences(of: "_", with: " ").capitalized)
+            parts.append(action.humanized)
         }
         if let current = entity.currentTemperature {
-            parts.append("Now \(formatTemperature(current))°")
+            parts.append("Now \(current.formatted(.compactValue))°")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    static func formatTemperature(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(0...1)))
     }
 }
 
@@ -89,7 +75,7 @@ struct TemperatureStepper: View {
     var body: some View {
         HStack(spacing: 0) {
             stepButton("minus", delta: -0.5, help: "Decrease target")
-            Text(value.map { "\(ClimateRow.formatTemperature($0))°" } ?? "—")
+            Text(value.map { "\($0.formatted(.compactValue))°" } ?? "—")
                 .font(.system(size: 13, weight: .semibold).monospacedDigit())
                 .contentTransition(.numericText(value: value ?? 0))
                 .frame(minWidth: 44)
@@ -112,7 +98,7 @@ struct TemperatureStepper: View {
     }
 }
 
-/// Compact menu showing the current HVAC mode; lists the device's `hvac_modes`.
+/// Compact menu showing the current HVAC mode; lists the device's `hvac_modes` with a native checkmark.
 struct HVACModeMenu: View {
     let entity: Entity
     let onSelect: (String) -> Void
@@ -125,14 +111,14 @@ struct HVACModeMenu: View {
                 .foregroundStyle(.secondary)
         } else {
             Menu {
-                ForEach(entity.hvacModes, id: \.self) { mode in
-                    let info = HVACModeInfo(mode)
-                    Button {
-                        onSelect(mode)
-                    } label: {
-                        Label(mode == entity.hvacMode ? "\(info.label)  ✓" : info.label, systemImage: info.symbolName)
+                Picker("Mode", selection: Binding(get: { entity.hvacMode }, set: { onSelect($0) })) {
+                    ForEach(entity.hvacModes, id: \.self) { mode in
+                        let info = HVACModeInfo(mode)
+                        Label(info.label, systemImage: info.symbolName).tag(mode)
                     }
                 }
+                .pickerStyle(.inline)
+                .labelsHidden()
             } label: {
                 HStack(spacing: 3) {
                     Text(current.label)

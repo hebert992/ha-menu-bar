@@ -14,8 +14,10 @@ struct ClimatePowerTests {
         ])
     }
 
+    /// Resolve the intent against the entity, then map the concrete command, as HomeStore does.
     private func call(_ action: EntityAction, _ entity: Entity, lastMode: String? = nil) -> ServiceCall? {
-        ServiceCallMapper.serviceCall(for: action, entity: entity, lastHvacMode: lastMode)
+        action.resolved(for: entity, lastHvacMode: lastMode)
+            .flatMap { ServiceCallMapper.serviceCall(for: $0, entityId: entity.entityId) }
     }
 
     private func setMode(_ mode: String) -> ServiceCall {
@@ -58,21 +60,21 @@ struct ClimatePowerTests {
         (["off", "eco"], "eco"),
     ])
     func defaultRestoreMode(modes: [String], expected: String) {
-        #expect(climate("off", modes: modes).restoreHvacMode(lastUsed: nil) == expected)
+        #expect(ClimateMemory.restoreMode(for: climate("off", modes: modes), lastUsed: nil) == expected)
     }
 
     @Test func lastUsedModeRules() {
         let entity = climate("off", modes: ["off", "heat", "cool"])
-        #expect(entity.restoreHvacMode(lastUsed: "heat") == "heat")
+        #expect(ClimateMemory.restoreMode(for: entity, lastUsed: "heat") == "heat")
         // A mode the device no longer offers, or "off", is ignored.
-        #expect(entity.restoreHvacMode(lastUsed: "dry") == "cool")
-        #expect(entity.restoreHvacMode(lastUsed: "off") == "cool")
+        #expect(ClimateMemory.restoreMode(for: entity, lastUsed: "dry") == "cool")
+        #expect(ClimateMemory.restoreMode(for: entity, lastUsed: "off") == "cool")
         // With unknown modes, the last used one is still the best guess.
-        #expect(climate("off", modes: []).restoreHvacMode(lastUsed: "dry") == "dry")
+        #expect(ClimateMemory.restoreMode(for: climate("off", modes: []), lastUsed: "dry") == "dry")
     }
 
     @Test func noUsableModeFallsBackToTurnOnService() {
-        #expect(climate("off", modes: ["off"]).restoreHvacMode(lastUsed: nil) == nil)
+        #expect(ClimateMemory.restoreMode(for: climate("off", modes: ["off"]), lastUsed: nil) == nil)
         let turnOn = ServiceCall(domain: "climate", service: "turn_on", entityId: "climate.studio")
         #expect(call(.turnOn, climate("off", modes: [])) == turnOn)
         #expect(call(.turnOn, climate("off", modes: ["off"])) == turnOn)
@@ -109,6 +111,20 @@ struct ClimatePowerTests {
         #expect(call(.toggle, climate("off", features: 256)) == setMode("cool"))
     }
 
+    @Test func resolvesClimatePowerIntentsToConcreteCommands() {
+        #expect(EntityAction.turnOn.resolved(for: climate("off"), lastHvacMode: "heat") == .setHvacMode("heat"))
+        #expect(EntityAction.turnOn.resolved(for: climate("off", modes: []), lastHvacMode: nil) == .turnOn)
+        #expect(EntityAction.toggle.resolved(for: climate("cool", features: 128), lastHvacMode: nil) == .turnOff)
+        #expect(EntityAction.toggle.resolved(for: climate("cool", features: 1), lastHvacMode: nil) == .setHvacMode("off"))
+        #expect(EntityAction.setTemperature(20).resolved(for: climate("cool"), lastHvacMode: nil) == .setTemperature(20))
+    }
+
+    @Test func resolveLeavesOtherDomainsUntouched() {
+        let light = Entity(entityId: "light.desk", state: "on", attributes: [:])
+        #expect(EntityAction.toggle.resolved(for: light, lastHvacMode: "cool") == .toggle)
+        #expect(EntityAction.turnOn.resolved(for: light, lastHvacMode: nil) == .turnOn)
+    }
+
     @Test func entityOverloadDelegatesForOtherDomains() {
         let light = Entity(entityId: "light.desk", state: "on", attributes: [:])
         #expect(call(.toggle, light) == ServiceCall(domain: "light", service: "toggle", entityId: "light.desk"))
@@ -118,20 +134,29 @@ struct ClimatePowerTests {
 
 @Suite("Optimistic updates")
 struct OptimisticUpdateTests {
+    private func predict(_ action: EntityAction, _ entity: Entity, lastMode: String? = nil) -> Entity? {
+        action.resolved(for: entity, lastHvacMode: lastMode).flatMap { OptimisticUpdate.apply($0, to: entity) }
+    }
+
     @Test func climateTurnOnUsesPreferredMode() {
         let entity = Entity(entityId: "climate.a", state: "off", attributes: [
             "hvac_modes": .array([.string("off"), .string("heat"), .string("cool")]),
         ])
-        #expect(OptimisticUpdate.apply(.turnOn, to: entity)?.state == "cool")
-        #expect(OptimisticUpdate.apply(.toggle, to: entity)?.state == "cool")
-        #expect(OptimisticUpdate.apply(.turnOn, to: entity, lastHvacMode: "heat")?.state == "heat")
-        #expect(OptimisticUpdate.apply(.setHvacMode("dry"), to: entity)?.state == "dry")
+        #expect(predict(.turnOn, entity)?.state == "cool")
+        #expect(predict(.toggle, entity)?.state == "cool")
+        #expect(predict(.turnOn, entity, lastMode: "heat")?.state == "heat")
+        #expect(predict(.setHvacMode("dry"), entity)?.state == "dry")
+    }
+
+    @Test func climateTurnOnFallbackHasNoPrediction() {
+        let entity = Entity(entityId: "climate.a", state: "off", attributes: [:])
+        #expect(predict(.turnOn, entity) == nil)
     }
 
     @Test func climateTurnOff() {
         let entity = Entity(entityId: "climate.a", state: "cool", attributes: [:])
-        #expect(OptimisticUpdate.apply(.turnOff, to: entity)?.state == "off")
-        #expect(OptimisticUpdate.apply(.toggle, to: entity)?.state == "off")
+        #expect(predict(.turnOff, entity)?.state == "off")
+        #expect(predict(.toggle, entity)?.state == "off")
     }
 
     @Test func toggleAndBrightness() {
@@ -153,15 +178,17 @@ struct OptimisticUpdateTests {
 @Suite("Connection status presentation")
 struct ConnectionStatusTests {
     @Test func labels() {
-        #expect(ConnectionStatus.connected.label(haVersion: "2026.10.1") == "Connected · Home Assistant 2026.10.1")
-        #expect(ConnectionStatus.connected.label(haVersion: nil) == "Connected")
-        #expect(ConnectionStatus.connecting.label(haVersion: "x") == "Connecting…")
-        #expect(ConnectionStatus.error("Boom").label(haVersion: nil) == "Error: Boom")
-        #expect(ConnectionStatus.notConfigured.label(haVersion: nil) == "Not configured")
+        #expect(ConnectionStatus.connected(haVersion: "2026.10.1").label == "Connected · Home Assistant 2026.10.1")
+        #expect(ConnectionStatus.connected(haVersion: nil).label == "Connected")
+        #expect(ConnectionStatus.connecting.label == "Connecting…")
+        #expect(ConnectionStatus.error("Boom").label == "Error: Boom")
+        #expect(ConnectionStatus.notConfigured.label == "Not configured")
+        #expect(ConnectionStatus.connected(haVersion: nil).isConnected)
+        #expect(!ConnectionStatus.connecting.isConnected)
     }
 
     @Test func indicators() {
-        #expect(ConnectionStatus.connected.indicator == .ok)
+        #expect(ConnectionStatus.connected(haVersion: "1").indicator == .ok)
         #expect(ConnectionStatus.connecting.indicator == .pending)
         #expect(ConnectionStatus.error("x").indicator == .failure)
         #expect(ConnectionStatus.notConfigured.indicator == .inactive)
@@ -190,5 +217,34 @@ struct HVACModePresentationTests {
         let info = HVACModeInfo("eco_boost")
         #expect(info.label == "Eco Boost")
         #expect(info.style == .other)
+    }
+}
+
+@Suite("Climate memory")
+struct ClimateMemoryTests {
+    private func climate(_ id: String, _ state: String) -> Entity {
+        Entity(entityId: id, state: state, attributes: [:])
+    }
+
+    @Test func recordsRunningModeAndReportsChanges() {
+        var memory = ClimateMemory()
+        let first = memory.record(climate("climate.a", "cool"))
+        let repeated = memory.record(climate("climate.a", "cool"))
+        let changed = memory.record(climate("climate.a", "dry"))
+        #expect(first)
+        #expect(!repeated)
+        #expect(changed)
+        #expect(memory.lastMode(for: "climate.a") == "dry")
+    }
+
+    @Test func ignoresOffUnavailableAndOtherDomains() {
+        var memory = ClimateMemory(lastModes: ["climate.a": "cool"])
+        let changes = [
+            memory.record(climate("climate.a", "off")),
+            memory.record(climate("climate.a", "unavailable")),
+            memory.record(Entity(entityId: "switch.a", state: "on", attributes: [:])),
+        ]
+        #expect(changes == [false, false, false])
+        #expect(memory.lastModes == ["climate.a": "cool"])
     }
 }

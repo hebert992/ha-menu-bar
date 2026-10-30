@@ -1,45 +1,27 @@
 import Foundation
 
-/// Predicts an entity's next state right after an action, so the UI reacts before HA confirms.
-/// The real `state_changed` event overwrites the prediction.
+/// Predicts an entity's next state right after a resolved command, so the UI reacts before HA
+/// confirms. The real `state_changed` event overwrites the prediction.
 enum OptimisticUpdate {
-    /// Returns the predicted entity, or nil when the action has no predictable state change.
-    static func apply(_ action: EntityAction, to entity: Entity, lastHvacMode: String? = nil) -> Entity? {
-        guard !entity.isUnavailable, let domain = entity.domain else { return nil }
+    /// Returns the predicted entity, or nil when the command has no predictable state change.
+    static func apply(_ action: EntityAction, to entity: Entity) -> Entity? {
+        guard !entity.isUnavailable, let kind = entity.kind else { return nil }
         var updated = entity
-
-        if domain == .climate {
-            let powerOn: Bool? = switch action {
-            case .turnOn: true
-            case .turnOff: false
-            case .toggle: !entity.isOn
-            default: nil
-            }
-            switch action {
-            case .turnOn, .turnOff, .toggle:
-                if powerOn == true {
-                    guard let onMode = entity.restoreHvacMode(lastUsed: lastHvacMode) else { return nil }
-                    updated.state = onMode
-                } else {
-                    updated.state = "off"
-                }
-            case let .setHvacMode(mode): updated.state = mode
-            case let .setTemperature(value): updated.attributes["temperature"] = .number(value)
-            default: return nil
-            }
-            return updated
-        }
-
         switch action {
-        case .toggle where domain.isToggleable:
+        case .toggle where kind.isToggleable:
             updated.state = entity.isOn ? "off" : "on"
-        case .turnOn where domain.isToggleable:
+        // `turn_on` on climate leaves the resulting mode to HA, so there is nothing to predict.
+        case .turnOn where kind.isToggleable:
             updated.state = "on"
-        case .turnOff where domain.isToggleable:
+        case .turnOff where kind.isToggleable || kind == .climate:
             updated.state = "off"
-        case let .setBrightness(percent) where domain == .light:
+        case let .setBrightness(percent) where kind == .light:
             updated.state = percent > 0 ? "on" : "off"
             updated.attributes["brightness"] = percent > 0 ? .number((Double(percent) * 2.55).rounded()) : .null
+        case let .setHvacMode(mode) where kind == .climate:
+            updated.state = mode
+        case let .setTemperature(value) where kind == .climate:
+            updated.attributes["temperature"] = .number(value)
         default:
             return nil
         }

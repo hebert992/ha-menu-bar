@@ -10,8 +10,18 @@ enum Theme {
     static let cardFill = Color.white.opacity(0.06)
     static let cardStroke = Color.white.opacity(0.07)
     static let hoverFill = Color.white.opacity(0.08)
+    static let badgeFill = Color.white.opacity(0.08)
     static let controlFill = Color.white.opacity(0.10)
+    /// Separators and empty-chart baselines.
+    static let hairline = Color.white.opacity(0.06)
     static let accentWarm = Color(red: 1.0, green: 0.78, blue: 0.28)
+}
+
+// MARK: - Formatting
+
+extension FormatStyle where Self == FloatingPointFormatStyle<Double> {
+    /// Values like `142`, `21.5`: at most one decimal.
+    static var compactValue: Self { .number.precision(.fractionLength(0...1)) }
 }
 
 // MARK: - Entity icons
@@ -86,7 +96,7 @@ struct IconBadge: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(active ? tint.opacity(0.22) : Color.white.opacity(0.08))
+                .fill(active ? tint.opacity(0.22) : Theme.badgeFill)
             Image(systemName: symbol)
                 .font(.system(size: size * 0.48, weight: .semibold))
                 .foregroundStyle(active ? tint : .secondary)
@@ -137,13 +147,11 @@ struct IndicatorDot: View {
 /// Connection dot for the panel header.
 struct StatusDot: View {
     let status: ConnectionStatus
-    var haVersion: String?
 
     var body: some View {
-        let label = status.label(haVersion: haVersion)
         IndicatorDot(indicator: status.indicator)
-            .help(label)
-            .accessibilityLabel(label)
+            .help(status.label)
+            .accessibilityLabel(status.label)
     }
 }
 
@@ -182,21 +190,22 @@ struct Card<Content: View>: View {
 
     var body: some View {
         VStack(spacing: 0) { content }
-            .background(
-                RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous)
-                    .fill(Theme.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous)
-                    .strokeBorder(Theme.cardStroke)
-            )
+            .cardBackground()
+    }
+}
+
+extension View {
+    /// Rounded card fill plus hairline border, shared by row cards and action tiles.
+    func cardBackground(fill: Color = Theme.cardFill, stroke: Color = Theme.cardStroke) -> some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous)
+        return background(shape.fill(fill)).overlay(shape.strokeBorder(stroke))
     }
 }
 
 struct RowDivider: View {
     var body: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.06))
+            .fill(Theme.hairline)
             .frame(height: 1)
             .padding(.leading, 46)
     }
@@ -250,6 +259,22 @@ struct HoverHighlight: ViewModifier {
 
 extension View {
     func hoverHighlight() -> some View { modifier(HoverHighlight()) }
+
+    /// Standard row padding plus hover highlight, applied once per row by `EntityRow`.
+    func entityRowChrome() -> some View {
+        padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .hoverHighlight()
+    }
+}
+
+/// Slight shrink while pressed, for tiles.
+struct PressScaleStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .animation(.spring(response: 0.2, dampingFraction: 0.7), value: configuration.isPressed)
+    }
 }
 
 /// Brings the hosting window to the front. Needed because the app runs as an accessory (no Dock icon).
@@ -265,17 +290,4 @@ struct BringWindowToFront: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
-}
-
-/// Opens the Settings window on a given tab and activates the app so it comes to the front.
-@MainActor
-struct SettingsOpener {
-    let store: HomeStore
-    let openSettings: OpenSettingsAction
-
-    func callAsFunction(_ tab: SettingsTab) {
-        store.settingsTab = tab
-        NSApp.activate()
-        openSettings()
-    }
 }

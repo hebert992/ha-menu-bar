@@ -16,19 +16,20 @@ struct PowerSensorRow: View {
                     Spacer(minLength: 4)
                     currentValue
                 }
-                PowerSparkline(points: points, now: context.date, tint: entity.tint)
-                    .padding(.leading, 36)
+                PowerSparkline(
+                    points: PowerHistory.downsampled(points, now: context.date),
+                    now: context.date,
+                    tint: entity.tint
+                )
+                .padding(.leading, 36)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
     }
 
     private var currentValue: some View {
         HStack(alignment: .firstTextBaseline, spacing: 3) {
             if let value = entity.numericState {
-                Text(value.formatted(.number.precision(.fractionLength(0...1))))
+                Text(value.formatted(.compactValue))
                     .font(.system(size: 20, weight: .semibold, design: .rounded).monospacedDigit())
                     .contentTransition(.numericText(value: value))
                     .animation(.snappy, value: value)
@@ -45,11 +46,11 @@ struct PowerSensorRow: View {
         }
     }
 
+    /// Min/max over the full (not downsampled) hour.
     private func rangeText(_ points: [PowerSample]) -> String? {
         guard let range = PowerHistory.range(points) else { return nil }
         let unit = entity.unit.map { " \($0)" } ?? ""
-        let format = FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0...1))
-        return "1h · min \(range.min.formatted(format))\(unit) · max \(range.max.formatted(format))\(unit)"
+        return "1h · min \(range.min.formatted(.compactValue))\(unit) · max \(range.max.formatted(.compactValue))\(unit)"
     }
 }
 
@@ -62,10 +63,12 @@ struct PowerSparkline: View {
     var body: some View {
         if points.count < 2 {
             RoundedRectangle(cornerRadius: 2)
-                .fill(Color.white.opacity(0.06))
+                .fill(Theme.hairline)
                 .frame(height: 2)
                 .frame(height: 36, alignment: .bottom)
         } else {
+            // Computed once per render; reading it per mark would be O(n²).
+            let yDomain = Self.yDomain(for: points)
             Chart(Array(points.enumerated()), id: \.offset) { _, point in
                 AreaMark(
                     x: .value("Time", point.date),
@@ -93,7 +96,7 @@ struct PowerSparkline: View {
     }
 
     /// Pads the range so a flat line sits mid-chart instead of on the edge.
-    private var yDomain: ClosedRange<Double> {
+    private static func yDomain(for points: [PowerSample]) -> ClosedRange<Double> {
         guard let range = PowerHistory.range(points) else { return 0...1 }
         let span = range.max - range.min
         let pad = span > 0 ? span * 0.15 : max(abs(range.max) * 0.1, 1)

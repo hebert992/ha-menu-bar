@@ -5,7 +5,8 @@ import Testing
 @Suite("Entity parsing")
 struct EntityParsingTests {
     private func decode(_ json: String) throws -> Entity {
-        try JSONDecoder().decode(Entity.self, from: Data(json.utf8))
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8))
+        return try #require(Entity(json: value))
     }
 
     @Test func parsesLightWithBrightness() throws {
@@ -130,9 +131,8 @@ struct EntityParsingTests {
     }
 
     @Test func rejectsPayloadWithoutEntityId() {
-        #expect(throws: (any Error).self) {
-            try decode(#"{"state": "on"}"#)
-        }
+        #expect(Entity(json: .object(["state": .string("on")])) == nil)
+        #expect(Entity(json: .string("light.a")) == nil)
     }
 }
 

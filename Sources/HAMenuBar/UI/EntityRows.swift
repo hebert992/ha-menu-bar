@@ -1,54 +1,72 @@
 import SwiftUI
 
-/// Picks the right row for an entity's domain.
+/// Picks the row for an entity's kind and applies the shared row chrome once.
 struct EntityRow: View {
     let entity: Entity
 
     var body: some View {
         Group {
-            switch entity.domain {
+            switch entity.kind {
             case .light: LightRow(entity: entity)
-            case .switch, .inputBoolean, .fan, .automation: ToggleRow(entity: entity)
+            case .toggle: ToggleRow(entity: entity)
             case .cover: CoverRow(entity: entity)
             case .climate: ClimateRow(entity: entity)
-            case .sensor where entity.isPowerSensor: PowerSensorRow(entity: entity)
-            default: SensorRow(entity: entity)
+            case .powerSensor: PowerSensorRow(entity: entity)
+            case .sensor, .action, nil: SensorRow(entity: entity)
             }
         }
+        .entityRowChrome()
         .opacity(entity.isUnavailable ? 0.55 : 1)
     }
 }
 
-/// Icon + name + subtitle, shared by all rows (including ClimateRow and PowerSensorRow).
-struct EntityRowLabel: View {
+/// Icon + name + a subtitle slot. Used by every panel row and by the entity picker.
+struct EntityRowLabel<Subtitle: View>: View {
     let entity: Entity
-    var subtitle: String?
     var active: Bool
+    var iconSize: CGFloat = 26
+    var nameFont: Font = .system(size: 12.5, weight: .medium)
+    @ViewBuilder var subtitle: Subtitle
 
     var body: some View {
         HStack(spacing: 10) {
-            IconBadge(symbol: entity.symbolName, tint: entity.tint, active: active)
+            IconBadge(symbol: entity.symbolName, tint: entity.tint, active: active, size: iconSize)
             VStack(alignment: .leading, spacing: 1) {
                 Text(entity.friendlyName)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(nameFont)
                     .lineLimit(1)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .contentTransition(.numericText())
-                }
+                subtitle
             }
         }
         .help(entity.entityId)
     }
 }
 
+extension EntityRowLabel where Subtitle == EntityRowSubtitle {
+    /// Convenience for the common case of a plain secondary text line.
+    init(entity: Entity, subtitle: String?, active: Bool) {
+        self.init(entity: entity, active: active) { EntityRowSubtitle(text: subtitle) }
+    }
+}
+
+/// Small secondary line under an entity name; renders nothing when `text` is nil.
+struct EntityRowSubtitle: View {
+    let text: String?
+
+    var body: some View {
+        if let text {
+            Text(text)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .contentTransition(.numericText())
+        }
+    }
+}
+
 private struct EntityToggle: View {
     @Environment(HomeStore.self) private var store
     let entity: Entity
-    var tint: Color
 
     var body: some View {
         Toggle("", isOn: Binding(
@@ -58,7 +76,7 @@ private struct EntityToggle: View {
         .labelsHidden()
         .toggleStyle(.switch)
         .controlSize(.mini)
-        .tint(tint)
+        .tint(entity.tint)
         .disabled(entity.isUnavailable)
     }
 }
@@ -69,9 +87,15 @@ private struct LightRow: View {
     @Environment(HomeStore.self) private var store
     let entity: Entity
 
+    /// A brightness value waiting to be sent. Changing it restarts the debounce in `.task(id:)`.
+    private struct BrightnessRequest: Equatable {
+        let percent: Int
+        let immediate: Bool
+    }
+
     @State private var brightness: Double = 0
     @State private var isEditing = false
-    @State private var sendTask: Task<Void, Never>?
+    @State private var request: BrightnessRequest?
 
     private var subtitle: String {
         if entity.isUnavailable { return entity.displayState }
@@ -85,7 +109,7 @@ private struct LightRow: View {
             HStack {
                 EntityRowLabel(entity: entity, subtitle: subtitle, active: entity.isOn)
                 Spacer()
-                EntityToggle(entity: entity, tint: Theme.accentWarm)
+                EntityToggle(entity: entity)
             }
             if entity.supportsBrightness {
                 HStack(spacing: 8) {
@@ -94,7 +118,7 @@ private struct LightRow: View {
                         .foregroundStyle(.secondary)
                     Slider(value: $brightness, in: 1...100) { editing in
                         isEditing = editing
-                        if !editing { send(immediately: true) }
+                        if !editing { request = BrightnessRequest(percent: targetPercent, immediate: true) }
                     }
                     .controlSize(.mini)
                     .tint(entity.isOn ? Theme.accentWarm : .gray)
@@ -106,34 +130,30 @@ private struct LightRow: View {
                 .disabled(entity.isUnavailable)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
         .onAppear(perform: syncFromEntity)
         .onChange(of: entity.brightnessPercent) { syncFromEntity() }
         .onChange(of: entity.isOn) { syncFromEntity() }
         .onChange(of: brightness) {
-            if isEditing { send(immediately: false) }
+            if isEditing { request = BrightnessRequest(percent: targetPercent, immediate: false) }
         }
-    }
-
-    private func syncFromEntity() {
-        guard !isEditing, sendTask == nil else { return }
-        brightness = Double(entity.isOn ? (entity.brightnessPercent ?? 100) : 1)
-    }
-
-    /// Debounced: sends ~300 ms after the last change while dragging, or right away on release.
-    private func send(immediately: Bool) {
-        sendTask?.cancel()
-        let target = Int(brightness.rounded())
-        sendTask = Task {
-            if !immediately {
+        // Debounced: sends ~300 ms after the last change while dragging, or right away on release.
+        .task(id: request) {
+            guard let request else { return }
+            if !request.immediate {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled else { return }
             }
-            store.perform(.setBrightness(percent: target), on: entity)
-            sendTask = nil
+            store.perform(.setBrightness(percent: request.percent), on: entity)
+            self.request = nil
         }
+    }
+
+    private var targetPercent: Int { Int(brightness.rounded()) }
+
+    /// Follows HA state, except while the user drags or a value is pending (avoids echo jumps).
+    private func syncFromEntity() {
+        guard !isEditing, request == nil else { return }
+        brightness = Double(entity.isOn ? (entity.brightnessPercent ?? 100) : 1)
     }
 }
 
@@ -146,11 +166,8 @@ private struct ToggleRow: View {
         HStack {
             EntityRowLabel(entity: entity, subtitle: entity.displayState, active: entity.isOn)
             Spacer()
-            EntityToggle(entity: entity, tint: entity.domain == .fan ? .cyan : .green)
+            EntityToggle(entity: entity)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
     }
 }
 
@@ -178,9 +195,6 @@ private struct CoverRow: View {
             }
             .disabled(entity.isUnavailable)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
     }
 
     private func control(_ symbol: String, help: String, action: EntityAction) -> some View {
@@ -208,8 +222,5 @@ private struct SensorRow: View {
                 .contentTransition(.numericText())
                 .animation(.snappy, value: entity.state)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .hoverHighlight()
     }
 }

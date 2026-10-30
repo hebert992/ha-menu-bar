@@ -6,9 +6,17 @@ struct PanelGroup: Identifiable, Equatable, Sendable {
     var id: PanelSection { section }
 }
 
+/// One picker row's identity. Only ids and names matter, so state changes don't rebuild the catalog.
+struct CatalogEntry: Equatable, Sendable {
+    let entityId: String
+    let name: String
+    let domain: EntityDomain
+}
+
+/// Picker section. Holds ids only; rows read live state from the store.
 struct CatalogGroup: Identifiable, Equatable, Sendable {
     let domain: EntityDomain
-    var entities: [Entity]
+    var entityIds: [String]
     var id: EntityDomain { domain }
 }
 
@@ -19,7 +27,7 @@ enum PanelLayout {
     static func groups(pinned: [String], entities: [String: Entity]) -> [PanelGroup] {
         var groups: [PanelGroup] = []
         for id in pinned {
-            guard let entity = entities[id], let section = entity.domain?.section else { continue }
+            guard let entity = entities[id], let section = entity.kind?.section else { continue }
             if let index = groups.firstIndex(where: { $0.section == section }) {
                 groups[index].entities.append(entity)
             } else {
@@ -29,23 +37,34 @@ enum PanelLayout {
         return groups
     }
 
-    /// Supported entities grouped by domain, sorted by name, filtered by a case-insensitive query
-    /// matched against friendly name and entity id.
-    static func catalog(entities: [Entity], query: String) -> [CatalogGroup] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered = entities.filter { entity in
-            guard entity.domain != nil else { return false }
-            guard !needle.isEmpty else { return true }
-            return entity.friendlyName.localizedCaseInsensitiveContains(needle)
-                || entity.entityId.localizedCaseInsensitiveContains(needle)
-        }
-        let byDomain = Dictionary(grouping: filtered) { $0.domain! }
-        return EntityDomain.allCases.compactMap { domain in
-            guard let items = byDomain[domain], !items.isEmpty else { return nil }
-            let sorted = items.sorted {
-                $0.friendlyName.localizedStandardCompare($1.friendlyName) == .orderedAscending
+    /// Supported entities as picker entries, sorted once by name (natural order: "Lamp 2" < "Lamp 10").
+    /// Sorting by entity id breaks ties so the result is deterministic.
+    static func catalogEntries(from entities: some Sequence<Entity>) -> [CatalogEntry] {
+        entities
+            .compactMap { entity in
+                entity.domain.map { CatalogEntry(entityId: entity.entityId, name: entity.friendlyName, domain: $0) }
             }
-            return CatalogGroup(domain: domain, entities: sorted)
+            .sorted {
+                switch $0.name.localizedStandardCompare($1.name) {
+                case .orderedAscending: true
+                case .orderedDescending: false
+                case .orderedSame: $0.entityId < $1.entityId
+                }
+            }
+    }
+
+    /// Entries grouped by domain (in `EntityDomain` order), filtered by a case-insensitive query
+    /// matched against name and entity id. Entries must already be sorted (see `catalogEntries`).
+    static func catalog(entries: [CatalogEntry], query: String) -> [CatalogGroup] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var byDomain: [EntityDomain: [String]] = [:]
+        for entry in entries
+        where needle.isEmpty || entry.name.localizedCaseInsensitiveContains(needle)
+            || entry.entityId.localizedCaseInsensitiveContains(needle) {
+            byDomain[entry.domain, default: []].append(entry.entityId)
+        }
+        return EntityDomain.allCases.compactMap { domain in
+            byDomain[domain].map { CatalogGroup(domain: domain, entityIds: $0) }
         }
     }
 }

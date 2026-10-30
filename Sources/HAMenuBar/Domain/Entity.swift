@@ -3,16 +3,23 @@ import Foundation
 /// A Home Assistant entity state, as returned by `get_states` or a `state_changed` event.
 struct Entity: Identifiable, Hashable, Sendable {
     let entityId: String
+    /// Parsed once from `entityId`; nil for domains this app does not support.
+    let domain: EntityDomain?
     var state: String
-    var attributes: [String: JSONValue]
+    var attributes: [String: JSONValue] {
+        didSet { kind = EntityKind(domain: domain, attributes: attributes) }
+    }
+    /// How the entity is presented; derived from domain and attributes, kept in sync on change.
+    private(set) var kind: EntityKind?
 
     var id: String { entityId }
-    var domain: EntityDomain? { EntityDomain(entityId: entityId) }
 
     init(entityId: String, state: String, attributes: [String: JSONValue]) {
         self.entityId = entityId
+        self.domain = EntityDomain(entityId: entityId)
         self.state = state
         self.attributes = attributes
+        self.kind = EntityKind(domain: domain, attributes: attributes)
     }
 
     /// Builds an entity from a raw HA state object. Returns nil when required fields are missing.
@@ -34,7 +41,7 @@ struct Entity: Identifiable, Hashable, Sendable {
     var friendlyName: String {
         if let name = attributes["friendly_name"]?.stringValue, !name.isEmpty { return name }
         let objectId = entityId.split(separator: ".", maxSplits: 1).last.map(String.init) ?? entityId
-        return objectId.split(separator: "_").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+        return objectId.humanized
     }
 
     var unit: String? { attributes["unit_of_measurement"]?.stringValue }
@@ -84,20 +91,6 @@ struct Entity: Identifiable, Hashable, Sendable {
         return state
     }
 
-    /// The HVAC mode to restore when powering on: the last mode the user ran, if the device still
-    /// offers it (or its modes are unknown); otherwise cool, heat_cool, auto, dry, fan_only, heat,
-    /// then the first non-off mode. Nil means only `climate.turn_on` is left.
-    func restoreHvacMode(lastUsed: String?) -> String? {
-        let modes = hvacModes
-        if let lastUsed, lastUsed != "off", modes.isEmpty || modes.contains(lastUsed) {
-            return lastUsed
-        }
-        for preferred in ["cool", "heat_cool", "auto", "dry", "fan_only", "heat"] where modes.contains(preferred) {
-            return preferred
-        }
-        return modes.first { $0 != "off" }
-    }
-
     /// Returns a new target temperature, rounded to 0.5 and clamped to the device's bounds.
     func adjustedTargetTemperature(by delta: Double, from base: Double? = nil) -> Double? {
         guard let start = base ?? targetTemperature else { return nil }
@@ -112,10 +105,7 @@ struct Entity: Identifiable, Hashable, Sendable {
     var numericState: Double? { Double(state).flatMap { $0.isFinite ? $0 : nil } }
 
     /// Sensors that get the live power sparkline.
-    var isPowerSensor: Bool {
-        guard domain == .sensor else { return false }
-        return deviceClass == "power" || unit == "W" || unit == "kW"
-    }
+    var isPowerSensor: Bool { kind == .powerSensor }
 
     // MARK: Covers
 
@@ -132,7 +122,7 @@ struct Entity: Identifiable, Hashable, Sendable {
         case .binarySensor:
             return Self.binarySensorLabel(on: isOn, deviceClass: deviceClass)
         default:
-            return state.replacingOccurrences(of: "_", with: " ").capitalized
+            return state.humanized
         }
     }
 
@@ -148,16 +138,5 @@ struct Entity: Identifiable, Hashable, Sendable {
         case "plug", "power": on ? "Plugged in" : "Unplugged"
         default: on ? "On" : "Off"
         }
-    }
-}
-
-extension Entity: Decodable {
-    init(from decoder: any Decoder) throws {
-        let json = try JSONValue(from: decoder)
-        guard let entity = Entity(json: json) else {
-            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
-                                                    debugDescription: "Missing entity_id or state"))
-        }
-        self = entity
     }
 }

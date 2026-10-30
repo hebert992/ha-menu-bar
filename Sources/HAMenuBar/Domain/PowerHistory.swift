@@ -5,83 +5,123 @@ struct PowerSample: Equatable, Sendable {
     var value: Double
 }
 
-/// Pure helpers for the power sparkline: parsing HA history, trimming to a window, merging live values.
+/// Pure helpers for the power sparkline. All functions expect and return samples sorted by date;
+/// only `merge` sorts, because history from HA may arrive in any order.
 enum PowerHistory {
     static let window: TimeInterval = 3600
 
-    /// Parses a `history/history_during_period` result (`{entity_id: [state, ...]}`).
-    /// Accepts the compressed format (`s`, `lu`, `lc`) and the full format (`state`, `last_updated`).
-    /// Non-numeric states (unavailable, unknown, ...) are dropped. Samples are sorted by date.
-    static func parse(_ result: JSONValue?) -> [String: [PowerSample]] {
-        guard let object = result?.objectValue else { return [:] }
-        var history: [String: [PowerSample]] = [:]
-        for (entityId, states) in object {
-            let samples = (states.arrayValue ?? []).compactMap(sample(from:))
-            history[entityId] = samples.sorted { $0.date < $1.date }
-        }
-        return history
-    }
-
-    private static func sample(from state: JSONValue) -> PowerSample? {
-        guard let raw = state["s"]?.stringValue ?? state["state"]?.stringValue,
-              let value = Double(raw), value.isFinite,
-              let date = timestamp(state["lu"]) ?? timestamp(state["lc"])
-                ?? timestamp(state["last_updated"]) ?? timestamp(state["last_changed"])
-        else { return nil }
-        return PowerSample(date: date, value: value)
-    }
-
-    private static func timestamp(_ value: JSONValue?) -> Date? {
-        switch value {
-        case let .number(seconds)?:
-            return Date(timeIntervalSince1970: seconds)
-        case let .string(text)?:
-            if let date = try? Date(text, strategy: .iso8601) { return date }
-            let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
-            return try? fractional.parse(text)
-        default:
-            return nil
-        }
-    }
-
     /// Keeps samples inside `[now - window, ...]`. The most recent sample before the window is carried
     /// to the window start, so a value that has not changed for over an hour still draws a line.
-    static func trimmed(_ samples: [PowerSample], now: Date, window: TimeInterval = window) -> [PowerSample] {
-        let start = now.addingTimeInterval(-window)
-        let sorted = samples.sorted { $0.date < $1.date }
-        var inside = sorted.filter { $0.date >= start }
-        if inside.first?.date != start, let carried = sorted.last(where: { $0.date < start }) {
-            inside.insert(PowerSample(date: start, value: carried.value), at: 0)
+    static func trimmed(_ samples: [PowerSample], now: Date) -> [PowerSample] {
+        var result = samples
+        dropExpired(&result, now: now)
+        return result
+    }
+
+    /// Appends a live sample, then drops expired samples from the front.
+    /// A sample with the same timestamp as an existing one replaces it.
+    static func appending(_ sample: PowerSample, to samples: [PowerSample], now: Date) -> [PowerSample] {
+        var result = samples
+        if let last = result.last, sample.date <= last.date {
+            // Rare: clock skew or an out-of-order event. Keep the buffer sorted.
+            if let same = result.lastIndex(where: { $0.date == sample.date }) {
+                result[same] = sample
+            } else {
+                let index = result.firstIndex { $0.date > sample.date } ?? result.endIndex
+                result.insert(sample, at: index)
+            }
+        } else {
+            result.append(sample)
         }
-        return inside
+        dropExpired(&result, now: now)
+        return result
     }
 
-    /// Appends a live sample. A sample with the same timestamp as an existing one replaces it.
-    static func appending(_ sample: PowerSample, to samples: [PowerSample], now: Date,
-                          window: TimeInterval = window) -> [PowerSample] {
-        var updated = samples.filter { $0.date != sample.date }
-        updated.append(sample)
-        return trimmed(updated, now: now, window: window)
+    /// Where a history request for this buffer should start: right after its last sample (gap fill
+    /// after a reconnect), or the start of the window when nothing is known yet.
+    static func historyStart(for buffer: [PowerSample], now: Date) -> Date {
+        buffer.last?.date ?? now.addingTimeInterval(-window)
     }
 
-    /// Combines a freshly loaded history with live samples that arrived after its last entry.
-    static func merge(history: [PowerSample], live: [PowerSample], now: Date,
-                      window: TimeInterval = window) -> [PowerSample] {
-        let lastHistoryDate = history.map(\.date).max() ?? .distantPast
-        return trimmed(history + live.filter { $0.date > lastHistoryDate }, now: now, window: window)
+    /// Merges history fetched from `since` into the live buffer:
+    /// - live samples up to `since` are kept (what we already had before the gap);
+    /// - history after `since` fills the gap and replaces live duplicates of the same events;
+    /// - live samples newer than the last history entry are appended.
+    /// On a full load (no live samples before `since`) all history is used, including HA's
+    /// start-time state, which may carry an older timestamp and becomes the window-start value.
+    static func merge(history: [PowerSample], live: [PowerSample], since: Date, now: Date) -> [PowerSample] {
+        let sortedHistory = history.sorted { $0.date < $1.date }
+        let kept = live.filter { $0.date <= since }
+        let fetched = kept.isEmpty ? sortedHistory : sortedHistory.filter { $0.date > since }
+        let lastFetched = fetched.last?.date ?? .distantPast
+        var result = kept + fetched + live.filter { $0.date > since && $0.date > lastFetched }
+        dropExpired(&result, now: now)
+        return result
     }
 
     /// Points to plot: the trimmed samples plus the latest value held until `now`.
-    static func chartPoints(_ samples: [PowerSample], now: Date, window: TimeInterval = window) -> [PowerSample] {
-        var points = trimmed(samples, now: now, window: window)
+    static func chartPoints(_ samples: [PowerSample], now: Date) -> [PowerSample] {
+        var points = trimmed(samples, now: now)
         if let last = points.last, last.date < now {
             points.append(PowerSample(date: now, value: last.value))
         }
         return points
     }
 
+    /// Reduces dense series to about `buckets` points by averaging per time bucket over the window.
+    /// The first and last points are kept as-is so the line still spans the whole chart.
+    static func downsampled(_ points: [PowerSample], now: Date, buckets: Int = 120) -> [PowerSample] {
+        guard points.count > buckets, buckets > 0, let first = points.first, let last = points.last else {
+            return points
+        }
+        let start = now.addingTimeInterval(-window)
+        let width = window / Double(buckets)
+        var result = [first]
+        var bucket = -1, count = 0.0, sumValue = 0.0, sumTime = 0.0
+
+        func flush() {
+            guard count > 0 else { return }
+            result.append(PowerSample(date: Date(timeIntervalSinceReferenceDate: sumTime / count),
+                                      value: sumValue / count))
+        }
+
+        for point in points.dropFirst().dropLast() {
+            let index = min(max(Int(point.date.timeIntervalSince(start) / width), 0), buckets - 1)
+            if index != bucket {
+                flush()
+                bucket = index
+                count = 0; sumValue = 0; sumTime = 0
+            }
+            count += 1
+            sumValue += point.value
+            sumTime += point.date.timeIntervalSinceReferenceDate
+        }
+        flush()
+        result.append(last)
+        return result
+    }
+
+    /// Minimum and maximum value in one pass.
     static func range(_ samples: [PowerSample]) -> (min: Double, max: Double)? {
-        guard let min = samples.map(\.value).min(), let max = samples.map(\.value).max() else { return nil }
-        return (min, max)
+        guard let first = samples.first?.value else { return nil }
+        return samples.dropFirst().reduce((min: first, max: first)) { range, sample in
+            (Swift.min(range.min, sample.value), Swift.max(range.max, sample.value))
+        }
+    }
+
+    /// Drops samples older than the window from the front, carrying the last expired value to the start.
+    private static func dropExpired(_ samples: inout [PowerSample], now: Date) {
+        let start = now.addingTimeInterval(-window)
+        guard let firstInside = samples.firstIndex(where: { $0.date >= start }) else {
+            // Everything expired: keep only the latest value, carried to the window start.
+            if let last = samples.last { samples = [PowerSample(date: start, value: last.value)] }
+            return
+        }
+        guard firstInside > 0 else { return }
+        let carried = samples[firstInside - 1].value
+        samples.removeFirst(firstInside)
+        if samples.first?.date != start {
+            samples.insert(PowerSample(date: start, value: carried), at: 0)
+        }
     }
 }

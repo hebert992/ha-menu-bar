@@ -57,7 +57,7 @@ struct WebSocketMessageTests {
     }
 
     @Test func decodesAuthHandshake() throws {
-        #expect(try decode(#"{"type":"auth_required","ha_version":"2026.10.1"}"#) == .authRequired(haVersion: "2026.10.1"))
+        #expect(try decode(#"{"type":"auth_required","ha_version":"2026.10.1"}"#) == .authRequired)
         #expect(try decode(#"{"type":"auth_ok","ha_version":"2026.10.1"}"#) == .authOK(haVersion: "2026.10.1"))
         #expect(try decode(#"{"type":"auth_invalid","message":"Invalid password"}"#) == .authInvalid(message: "Invalid password"))
     }
@@ -70,13 +70,13 @@ struct WebSocketMessageTests {
           {"bogus": true}
         ]}
         """)
-        guard case let .result(id, success, result, error) = message else {
+        guard case let .result(id, success, result, errorMessage) = message else {
             Issue.record("Expected result, got \(message)")
             return
         }
         #expect(id == 1)
         #expect(success)
-        #expect(error == nil)
+        #expect(errorMessage == nil)
         let entities = Entity.list(from: result)
         #expect(entities.map(\.entityId) == ["light.a", "sensor.b"])
         #expect(entities.first?.brightnessPercent == 100)
@@ -87,8 +87,7 @@ struct WebSocketMessageTests {
         {"id": 5, "type": "result", "success": false,
          "error": {"code": "service_not_found", "message": "Service not found."}}
         """)
-        #expect(message == .result(id: 5, success: false, result: nil,
-                                   error: HAErrorPayload(code: "service_not_found", message: "Service not found.")))
+        #expect(message == .result(id: 5, success: false, result: nil, errorMessage: "Service not found."))
     }
 
     @Test func decodesStateChangedEvent() throws {
@@ -103,11 +102,10 @@ struct WebSocketMessageTests {
           "origin": "LOCAL", "time_fired": "2026-10-30T10:00:00+00:00"
         }}
         """)
-        guard case let .stateChanged(subscriptionId, entityId, newState) = message else {
+        guard case let .stateChanged(entityId, newState) = message else {
             Issue.record("Expected stateChanged, got \(message)")
             return
         }
-        #expect(subscriptionId == 2)
         #expect(entityId == "switch.plug")
         #expect(newState?.isOn == true)
         #expect(newState?.friendlyName == "Plug")
@@ -118,12 +116,20 @@ struct WebSocketMessageTests {
         {"id": 2, "type": "event", "event": {"event_type": "state_changed",
           "data": {"entity_id": "switch.gone", "old_state": {"entity_id": "switch.gone", "state": "on"}, "new_state": null}}}
         """)
-        #expect(message == .stateChanged(subscriptionId: 2, entityId: "switch.gone", newState: nil))
+        #expect(message == .stateChanged(entityId: "switch.gone", newState: nil))
     }
 
     @Test func decodesPongAndUnknown() throws {
-        #expect(try decode(#"{"id": 12, "type": "pong"}"#) == .pong(id: 12))
-        #expect(try decode(#"{"type": "something_new"}"#) == .unknown(type: "something_new"))
+        #expect(try decode(#"{"id": 12, "type": "pong"}"#) == .pong)
+        #expect(try decode(#"{"type": "something_new"}"#) == .unknown)
+        // Events other than state_changed are not used.
+        #expect(try decode(#"{"id": 2, "type": "event", "event": {"event_type": "call_service"}}"#) == .unknown)
+    }
+
+    @Test func decodesWebSocketStringAndDataFrames() throws {
+        let json = #"{"type":"auth_ok","ha_version":"1"}"#
+        #expect(try HAIncomingMessage.decode(URLSessionWebSocketTask.Message.string(json)) == .authOK(haVersion: "1"))
+        #expect(try HAIncomingMessage.decode(URLSessionWebSocketTask.Message.data(Data(json.utf8))) == .authOK(haVersion: "1"))
     }
 
     @Test func rejectsMalformedFrames() {

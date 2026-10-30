@@ -1,13 +1,11 @@
 import AppKit
 import SwiftUI
 
-/// The popover panel shown from the menu bar icon.
+/// The popover panel shown from the menu bar icon. Only alive while the panel is open (see `PanelRoot`).
 struct PanelView: View {
     @Environment(HomeStore.self) private var store
     @Environment(\.openSettings) private var openSettings
-    @State private var contentHeight: CGFloat = 0
-
-    private var showSettings: SettingsOpener { SettingsOpener(store: store, openSettings: openSettings) }
+    @Binding var contentHeight: CGFloat
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,7 +14,7 @@ struct PanelView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 10)
 
-            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+            Rectangle().fill(Theme.hairline).frame(height: 1)
 
             content
 
@@ -25,8 +23,15 @@ struct PanelView: View {
             }
         }
         .frame(width: Theme.panelWidth)
-        .preferredColorScheme(.dark)
         .animation(.easeInOut(duration: 0.2), value: store.lastError)
+    }
+
+    /// Opens Settings on a tab and activates the app so the window comes to the front
+    /// (the app runs as an accessory, without a Dock icon).
+    private func showSettings(_ tab: SettingsTab) {
+        store.settingsTab = tab
+        NSApp.activate()
+        openSettings()
     }
 
     // MARK: Header
@@ -35,7 +40,7 @@ struct PanelView: View {
         HStack(spacing: 8) {
             Text("Home")
                 .font(.system(size: 15, weight: .bold))
-            StatusDot(status: store.status, haVersion: store.haVersion)
+            StatusDot(status: store.status)
             if case .connecting = store.status {
                 ProgressView().controlSize(.mini)
             }
@@ -72,6 +77,7 @@ struct PanelView: View {
 
     @ViewBuilder
     private var content: some View {
+        let groups = store.groups
         if !store.settings.isConfigured {
             EmptyStateView(
                 symbol: "house.and.flag.fill",
@@ -86,11 +92,11 @@ struct PanelView: View {
                 message: "Pick the lights, scenes and sensors you want at hand.",
                 actionTitle: "Choose Entities"
             ) { showSettings(.entities) }
-        } else if store.groups.isEmpty {
+        } else if groups.isEmpty {
             loadingState
         } else {
             ScrollView(.vertical) {
-                sections
+                sections(groups)
                     .padding(12)
                     .background(
                         GeometryReader { proxy in
@@ -104,9 +110,9 @@ struct PanelView: View {
         }
     }
 
-    private var sections: some View {
+    private func sections(_ groups: [PanelGroup]) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(store.groups) { group in
+            ForEach(groups) { group in
                 VStack(alignment: .leading, spacing: 6) {
                     SectionHeader(title: group.section.title)
                     SectionContent(group: group)
@@ -160,7 +166,7 @@ private struct ContentHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-/// Renders a section with the layout appropriate for its domains.
+/// Renders a section: tiles for actions, a card of rows for everything else.
 private struct SectionContent: View {
     let group: PanelGroup
 

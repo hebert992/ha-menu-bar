@@ -32,6 +32,17 @@ struct SettingsStoreTests {
         #expect(reloaded.pinnedEntityIds == ["light.a", "switch.b"])
     }
 
+    @Test func pinnedSetTracksOrderedPins() {
+        let (store, _) = makeStore()
+        store.togglePin("a")
+        store.togglePin("b")
+        store.movePinned(fromOffsets: IndexSet(integer: 1), toOffset: 0)
+        #expect(store.isPinned("a") && store.isPinned("b"))
+        store.togglePin("a")
+        #expect(!store.isPinned("a"))
+        #expect(store.pinnedEntityIds == ["b"])
+    }
+
     @Test func togglePinRemovesExisting() {
         let (store, _) = makeStore()
         store.togglePin("light.a")
@@ -61,23 +72,13 @@ struct SettingsStoreTests {
         #expect(!store.hasToken)
     }
 
-    @Test func remembersLastHvacModePerEntity() {
+    @Test func persistsLastHvacModesBlob() {
         let (store, defaults) = makeStore()
-        #expect(store.lastHvacMode(for: "climate.a") == nil)
-        store.recordHvacMode("cool", for: "climate.a")
-        store.recordHvacMode("heat", for: "climate.b")
-        store.recordHvacMode("dry", for: "climate.a")
+        #expect(store.lastHvacModes.isEmpty)
+        store.setLastHvacModes(["climate.a": "dry", "climate.b": "heat"])
 
         let reloaded = SettingsStore(defaults: defaults, tokenStore: InMemoryTokenStore())
-        #expect(reloaded.lastHvacMode(for: "climate.a") == "dry")
-        #expect(reloaded.lastHvacMode(for: "climate.b") == "heat")
-    }
-
-    @Test func ignoresOffWhenRecordingHvacMode() {
-        let (store, _) = makeStore()
-        store.recordHvacMode("cool", for: "climate.a")
-        store.recordHvacMode("off", for: "climate.a")
-        #expect(store.lastHvacMode(for: "climate.a") == "cool")
+        #expect(reloaded.lastHvacModes == ["climate.a": "dry", "climate.b": "heat"])
     }
 
     @Test func isConfiguredNeedsValidURLAndToken() throws {
@@ -131,18 +132,31 @@ struct PanelLayoutTests {
         let entities = [
             Entity(entityId: "light.kitchen", state: "on", attributes: ["friendly_name": .string("Kitchen")]),
             Entity(entityId: "light.bath", state: "off", attributes: ["friendly_name": .string("Bathroom")]),
+            Entity(entityId: "light.l10", state: "off", attributes: ["friendly_name": .string("Lamp 10")]),
+            Entity(entityId: "light.l2", state: "off", attributes: ["friendly_name": .string("Lamp 2")]),
             Entity(entityId: "switch.kettle", state: "off", attributes: [:]),
             Entity(entityId: "media_player.tv", state: "off", attributes: [:]),
         ]
-        let all = PanelLayout.catalog(entities: entities, query: "")
+        let entries = PanelLayout.catalogEntries(from: entities)
+        #expect(entries.count == 5)
+
+        let all = PanelLayout.catalog(entries: entries, query: "")
         #expect(all.map(\.domain) == [.light, .switch])
-        #expect(all[0].entities.map(\.entityId) == ["light.bath", "light.kitchen"])
+        #expect(all[0].entityIds == ["light.bath", "light.kitchen", "light.l2", "light.l10"])
 
-        let filtered = PanelLayout.catalog(entities: entities, query: "kit")
+        let filtered = PanelLayout.catalog(entries: entries, query: "kit")
         #expect(filtered.map(\.domain) == [.light])
-        #expect(filtered[0].entities.map(\.entityId) == ["light.kitchen"])
+        #expect(filtered[0].entityIds == ["light.kitchen"])
 
-        let byId = PanelLayout.catalog(entities: entities, query: "kettle")
+        let byId = PanelLayout.catalog(entries: entries, query: "kettle")
         #expect(byId.map(\.domain) == [.switch])
+    }
+
+    @Test func catalogEntriesChangeOnlyWithIdsAndNames() {
+        let a = [Entity(entityId: "light.a", state: "on", attributes: ["friendly_name": .string("A")])]
+        let sameNameNewState = [Entity(entityId: "light.a", state: "off", attributes: ["friendly_name": .string("A")])]
+        let renamed = [Entity(entityId: "light.a", state: "on", attributes: ["friendly_name": .string("B")])]
+        #expect(PanelLayout.catalogEntries(from: a) == PanelLayout.catalogEntries(from: sameNameNewState))
+        #expect(PanelLayout.catalogEntries(from: a) != PanelLayout.catalogEntries(from: renamed))
     }
 }

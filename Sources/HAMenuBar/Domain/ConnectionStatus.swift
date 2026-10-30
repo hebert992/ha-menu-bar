@@ -8,8 +8,13 @@ enum StatusIndicator: Equatable, Sendable {
 enum ConnectionStatus: Equatable, Sendable {
     case notConfigured
     case connecting
-    case connected
+    case connected(haVersion: String?)
     case error(String)
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
 
     var indicator: StatusIndicator {
         switch self {
@@ -20,9 +25,9 @@ enum ConnectionStatus: Equatable, Sendable {
         }
     }
 
-    func label(haVersion: String?) -> String {
+    var label: String {
         switch self {
-        case .connected: haVersion.map { "Connected · Home Assistant \($0)" } ?? "Connected"
+        case let .connected(haVersion): haVersion.map { "Connected · Home Assistant \($0)" } ?? "Connected"
         case .connecting: "Connecting…"
         case let .error(message): "Error: \(message)"
         case .notConfigured: "Not configured"

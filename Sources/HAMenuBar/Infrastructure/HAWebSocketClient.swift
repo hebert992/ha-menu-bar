@@ -2,17 +2,21 @@ import Foundation
 import OSLog
 
 enum HAConnectionError: Error, LocalizedError {
-    case invalidURL
     case invalidToken(String?)
-    case unexpectedResponse
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL: "The Home Assistant URL is not valid."
         case let .invalidToken(message): "Authentication failed\(message.map { ": \($0)" } ?? ".")"
-        case .unexpectedResponse: "Unexpected response from Home Assistant."
         }
     }
+}
+
+/// Result of asking the client to call a service.
+enum ServiceCallOutcome: Equatable, Sendable {
+    /// Sent; the outcome arrives later as `.serviceResult` with this id.
+    case sent(id: Int)
+    /// Not authenticated, nothing was sent.
+    case notConnected
 }
 
 /// Main-actor isolated WebSocket client for the Home Assistant API.
@@ -22,11 +26,11 @@ enum HAConnectionError: Error, LocalizedError {
 final class HAWebSocketClient {
     enum Event {
         case status(ConnectionStatus)
-        case serverVersion(String?)
-        case history(JSONValue?)
         case states([Entity])
         case stateChanged(entityId: String, entity: Entity?)
-        case serviceError(String)
+        /// Sent once per history request, also on failure (with empty samples).
+        case history(requested: [String], samples: [String: [PowerSample]])
+        case serviceResult(id: Int, errorMessage: String?)
     }
 
     var onEvent: (@MainActor (Event) -> Void)?
@@ -34,8 +38,9 @@ final class HAWebSocketClient {
     private let logger = Logger(subsystem: "dev.hebert.hamenubar", category: "websocket")
     private let session = URLSession(configuration: .default)
     private let backoff = ReconnectBackoff(base: 1, cap: 30)
+    private let clock = ContinuousClock()
     private let heartbeatInterval: Duration = .seconds(30)
-    private let heartbeatTimeout: TimeInterval = 75
+    private let heartbeatTimeout: Duration = .seconds(75)
 
     private var url: URL?
     private var token: String?
@@ -43,16 +48,19 @@ final class HAWebSocketClient {
     private var attempt = 0
     private var nextMessageId = 1
     private var getStatesId: Int?
-    private var historyRequestIds: Set<Int> = []
+    private var historyRequests: [Int: [String]] = [:]
+    private var pendingServiceCalls: Set<Int> = []
     private var isAuthenticated = false
-    private var lastPong = Date()
+    private var lastPong: ContinuousClock.Instant
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
 
-    var isConnected: Bool { isAuthenticated }
+    init() {
+        lastPong = clock.now
+    }
 
     // MARK: Public API
 
@@ -85,19 +93,19 @@ final class HAWebSocketClient {
         }
     }
 
-    func callService(_ call: ServiceCall) {
-        guard isAuthenticated else {
-            onEvent?(.serviceError("Not connected to Home Assistant."))
-            return
-        }
-        send(.callService(id: makeId(), call: call))
+    func callService(_ call: ServiceCall) -> ServiceCallOutcome {
+        guard isAuthenticated else { return .notConnected }
+        let id = makeId()
+        pendingServiceCalls.insert(id)
+        send(.callService(id: id, call: call))
+        return .sent(id: id)
     }
 
     /// Requests recorder history for the given entities since `start`. Delivered as `.history`.
     func requestHistory(entityIds: [String], since start: Date) {
         guard isAuthenticated, !entityIds.isEmpty else { return }
         let id = makeId()
-        historyRequestIds.insert(id)
+        historyRequests[id] = entityIds
         send(.historyDuringPeriod(id: id, start: start, entityIds: entityIds))
     }
 
@@ -118,6 +126,7 @@ final class HAWebSocketClient {
         }
     }
 
+    /// Closes the socket and forgets in-flight requests; their results can no longer arrive.
     private func teardown() {
         receiveTask?.cancel()
         receiveTask = nil
@@ -127,7 +136,8 @@ final class HAWebSocketClient {
         socket = nil
         isAuthenticated = false
         getStatesId = nil
-        historyRequestIds = []
+        historyRequests = [:]
+        pendingServiceCalls = []
     }
 
     private func receiveLoop(_ socket: URLSessionWebSocketTask) async {
@@ -138,13 +148,13 @@ final class HAWebSocketClient {
                 handle(message)
             } catch {
                 guard self.socket === socket, !Task.isCancelled else { return }
-                connectionLost(reason: error.localizedDescription)
+                connectionLost()
                 return
             }
         }
     }
 
-    private func connectionLost(reason: String) {
+    private func connectionLost() {
         teardown()
         guard shouldRun else { return }
         let delay = backoff.delay(forAttempt: attempt)
@@ -162,16 +172,9 @@ final class HAWebSocketClient {
     // MARK: Message handling
 
     private func handle(_ message: URLSessionWebSocketTask.Message) {
-        let data: Data
-        switch message {
-        case let .string(text): data = Data(text.utf8)
-        case let .data(raw): data = raw
-        @unknown default: return
-        }
-
         let incoming: HAIncomingMessage
         do {
-            incoming = try HAIncomingMessage.decode(data)
+            incoming = try HAIncomingMessage.decode(message)
         } catch {
             logger.error("Dropping malformed frame")
             return
@@ -183,10 +186,9 @@ final class HAWebSocketClient {
             send(.auth(accessToken: token))
         case let .authOK(version):
             isAuthenticated = true
-            onEvent?(.serverVersion(version))
             attempt = 0
-            lastPong = Date()
-            onEvent?(.status(.connected))
+            lastPong = clock.now
+            onEvent?(.status(.connected(haVersion: version)))
             requestStates()
             send(.subscribeEvents(id: makeId(), eventType: "state_changed"))
             startHeartbeat()
@@ -194,22 +196,28 @@ final class HAWebSocketClient {
             shouldRun = false
             teardown()
             onEvent?(.status(.error(HAConnectionError.invalidToken(message).localizedDescription)))
-        case let .result(id, success, result, error):
-            if id == getStatesId {
-                getStatesId = nil
-                if success { onEvent?(.states(Entity.list(from: result))) }
-            } else if historyRequestIds.remove(id) != nil {
-                // History is best effort (the recorder may be disabled); failures are not surfaced.
-                if success { onEvent?(.history(result)) }
-            } else if !success {
-                onEvent?(.serviceError(error?.message ?? "Home Assistant rejected the request."))
-            }
-        case let .stateChanged(_, entityId, newState):
+        case let .result(id, success, result, errorMessage):
+            handleResult(id: id, success: success, result: result, errorMessage: errorMessage)
+        case let .stateChanged(entityId, newState):
             onEvent?(.stateChanged(entityId: entityId, entity: newState))
         case .pong:
-            lastPong = Date()
-        case .event, .unknown:
+            lastPong = clock.now
+        case .unknown:
             break
+        }
+    }
+
+    private func handleResult(id: Int, success: Bool, result: JSONValue?, errorMessage: String?) {
+        if id == getStatesId {
+            getStatesId = nil
+            if success { onEvent?(.states(Entity.list(from: result))) }
+        } else if let requested = historyRequests.removeValue(forKey: id) {
+            // History is best effort (the recorder may be disabled); failures are not surfaced.
+            let samples = success ? HAHistoryDecoder.samples(from: result) : [:]
+            onEvent?(.history(requested: requested, samples: samples))
+        } else if pendingServiceCalls.remove(id) != nil {
+            let message = success ? nil : (errorMessage ?? "Home Assistant rejected the request.")
+            onEvent?(.serviceResult(id: id, errorMessage: message))
         }
     }
 
@@ -221,12 +229,12 @@ final class HAWebSocketClient {
 
     private func startHeartbeat() {
         heartbeatTask?.cancel()
-        heartbeatTask = Task { [weak self, heartbeatInterval] in
+        heartbeatTask = Task { [weak self, clock, heartbeatInterval, heartbeatTimeout] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: heartbeatInterval)
+                try? await Task.sleep(for: heartbeatInterval, clock: clock)
                 guard !Task.isCancelled, let self else { return }
-                if Date().timeIntervalSince(self.lastPong) > self.heartbeatTimeout {
-                    self.connectionLost(reason: "Heartbeat timeout")
+                if self.lastPong.duration(to: clock.now) > heartbeatTimeout {
+                    self.connectionLost()
                     return
                 }
                 self.send(.ping(id: self.makeId()))
@@ -265,14 +273,7 @@ final class HAWebSocketClient {
         }
 
         while true {
-            let message = try await socket.receive()
-            let data: Data
-            switch message {
-            case let .string(text): data = Data(text.utf8)
-            case let .data(raw): data = raw
-            @unknown default: throw HAConnectionError.unexpectedResponse
-            }
-            switch try HAIncomingMessage.decode(data) {
+            switch try HAIncomingMessage.decode(try await socket.receive()) {
             case .authRequired:
                 try await socket.send(.string(HAOutgoingMessage.auth(accessToken: token).encodedString()))
             case let .authOK(version):

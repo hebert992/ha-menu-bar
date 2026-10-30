@@ -41,13 +41,9 @@ private struct ActionTile: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
-            .background(
-                RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous)
-                    .fill(fired ? entity.tint.opacity(0.28) : (hovering ? Theme.hoverFill.opacity(1.6) : Theme.cardFill))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous)
-                    .strokeBorder(fired ? entity.tint.opacity(0.6) : Theme.cardStroke)
+            .cardBackground(
+                fill: fired ? entity.tint.opacity(0.28) : (hovering ? Theme.hoverFill.opacity(1.6) : Theme.cardFill),
+                stroke: fired ? entity.tint.opacity(0.6) : Theme.cardStroke
             )
             .contentShape(RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
         }
@@ -67,13 +63,5 @@ private struct ActionTile: View {
             try? await Task.sleep(for: .milliseconds(900))
             fired = false
         }
-    }
-}
-
-struct PressScaleStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.95 : 1)
-            .animation(.spring(response: 0.2, dampingFraction: 0.7), value: configuration.isPressed)
     }
 }

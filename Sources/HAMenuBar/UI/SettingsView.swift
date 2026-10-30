@@ -36,10 +36,7 @@ private struct ConnectionSettingsView: View {
     var body: some View {
         Form {
             Section("Status") {
-                StatusLine(
-                    indicator: store.status.indicator,
-                    text: store.status.label(haVersion: store.haVersion)
-                )
+                StatusLine(indicator: store.status.indicator, text: store.status.label)
                 .animation(.easeInOut(duration: 0.2), value: store.status)
             }
 

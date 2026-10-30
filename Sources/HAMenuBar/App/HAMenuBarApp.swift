@@ -14,7 +14,7 @@ struct HAMenuBarApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            PanelView()
+            PanelRoot()
                 .environment(store)
         } label: {
             Image(systemName: "house.fill")
